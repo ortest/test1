@@ -1,0 +1,265 @@
+diff --git a/requirements.txt b/requirements.txt
+index 4bab686..82bbff9 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -12,7 +12,6 @@ aliyun-python-sdk-ecs==2.1.0
+ redis==2.10.5
+ retry==0.9.2
+ bce-python-sdk==0.8.11
+-jsonschema==2.5.1
+ 
+ # Plugin for flake8
+ #pep8==1.7.0
+diff --git a/service/management/commands/lbtest.py b/service/management/commands/lbtest.py
+index 65a257c..4b662ff 100644
+--- a/service/management/commands/lbtest.py
++++ b/service/management/commands/lbtest.py
+@@ -1,6 +1,6 @@
+ from django.core.management.base import BaseCommand
+ import logging
+-from lb import aws
++from lb import aws, aliyun
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -27,7 +27,7 @@ class Command(BaseCommand):
+         #     ])
+         # print lbid
+ #         print lb.retrieve('druid')
+-        print lb.retrieve_health_info('druid')
++        print lb.retrieve_health_info('druid1')
+ #         print lb.retrieve_health_info('156b6cd2db3-cn-beijing-btc-a01')
+         # lb.add_instances('alauda-weyy7em', ['172.31.45.113'])
+         # lb.remove_instances('alauda-4007wdq', ['172.31.45.113'])
+diff --git a/service/migrations/0014_hostport_is_aliens.py b/service/migrations/0014_hostport_is_aliens.py
+deleted file mode 100644
+index 079ede3..0000000
+--- a/service/migrations/0014_hostport_is_aliens.py
++++ /dev/null
+@@ -1,19 +0,0 @@
+-# -*- coding: utf-8 -*-
+-from __future__ import unicode_literals
+-
+-from django.db import migrations, models
+-
+-
+-class Migration(migrations.Migration):
+-
+-    dependencies = [
+-        ('service', '0013_auto_20160824_0825'),
+-    ]
+-
+-    operations = [
+-        migrations.AddField(
+-            model_name='hostport',
+-            name='is_aliens',
+-            field=models.BooleanField(default=False),
+-        ),
+-    ]
+diff --git a/service/models.py b/service/models.py
+index c3042e9..4856fc0 100644
+--- a/service/models.py
++++ b/service/models.py
+@@ -489,16 +489,12 @@ class Service(models.Model):
+ 
+         view['instances'] = instances
+         view['current_num_instances'] = len(instances)
++        view['healthy_num_instances'] = current_app.tasks_healthy if current_app else 0
+         view['health_checks'] = self.get_health_checks()
+ 
+-        if view['health_checks']:
+-            if current_app:
+-                view['healthy'] = self.get_app_healthy(current_app)
+-                view['healthy_num_instances'] = current_app.tasks_healthy
+-            else:
+-                view['healthy_num_instances'] = 0
+-        else:
+-            view['healthy_num_instances'] = view['current_num_instances']
++        if view['health_checks'] and current_app:
++            view['healthy'] = self.get_app_healthy(current_app)
++            view['healthy_num_instances'] = current_app.tasks_healthy
+ 
+         return view
+ 
+@@ -552,7 +548,6 @@ class HostPort(models.Model):
+     service = models.ForeignKey(Service, on_delete=models.CASCADE)
+     container_port = models.IntegerField()
+     host_port = models.IntegerField()
+-    is_aliens = models.BooleanField(default=False)
+ 
+     class Meta:
+         unique_together = (('service', 'container_port'),
+diff --git a/service/views.py b/service/views.py
+index 3f95652..6c2f803 100644
+--- a/service/views.py
++++ b/service/views.py
+@@ -3,7 +3,6 @@ import uuid
+ import logging
+ import copy
+ import requests
+-import itertools
+ from collections import defaultdict
+ 
+ from django.conf import settings
+@@ -26,7 +25,6 @@ from . import region
+ from exception import SvenException
+ from service.activity import get_load_balancer
+ from jsonschema.validators import Draft4Validator
+-from django.db.models import Q
+ 
+ logger = logging.getLogger(__name__)
+ REDIS_CLIENT = settings.REDIS_CLIENT
+@@ -172,7 +170,7 @@ def validate_create_input(data):
+         raise SvenException('bad_request', message_params=[
+             'instance_size {} is not valid.'.format(data['instance_size'])])
+ 
+-    validate_health_checks(data)
++    validate_health_checks(data.get('health_checks'))
+ 
+ 
+ def validate_autoscaling_config(config):
+@@ -338,7 +336,7 @@ def validate_update_input(data, service):
+         raise SvenException('bad_request', message_params=[
+             'instance_size {} is not valid.'.format(data['instance_size'])])
+ 
+-    validate_health_checks(data)
++    validate_health_checks(data.get('health_checks'))
+ 
+ 
+ def validate_scale_up_or_down(data, service):
+@@ -446,44 +444,6 @@ def fill_in_default(data, defaults):
+     return data
+ 
+ 
+-def update_health_checks(service, health_checks):
+-
+-    if not health_checks:
+-        return
+-
+-    health_check_ports = [
+-        health_check['port']
+-        for health_check in health_checks
+-        if health_check.get('port')
+-    ]
+-    hostports_set = service.hostport_set.filter(
+-        Q(is_aliens=True) | Q(container_port__in=health_check_ports.keys())
+-    )
+-
+-    host_ports = []
+-    freed_hostports = []
+-    for hostport in hostports_set:
+-        if hostport.is_aliens and hostport.container_port not in health_check_ports:
+-            freed_hostports.append(hostport)
+-        else:
+-            host_ports.append(hostport)
+-
+-    allocation_ports = set(health_check_ports) - set(cp.container_port for cp in host_ports)
+-
+-    for allocation_port in allocation_ports:
+-        if 'BRIDGE' == service.network_mode:
+-            host_port = portallocator.allocate_port_bridge(service.region_id)
+-        elif 'HOST' == service.network_mode:
+-            host_port = portallocator.allocate_port_host(service.region_id, allocation_port)
+-        service.hostport_set.create(host_port=host_port, container_port=allocation_port,
+-                                    is_aliens=True)
+-
+-    for hostport in freed_hostports:
+-        portallocator.free_host_port(service.region_id, hostport.hostports)
+-    service.hostport_set.filter(container_port__in=(hp.hostport for hp in freed_hostports),
+-                                is_aliens=True).delete()
+-
+-
+ def update_service_version(service,
+                            update_args,
+                            request_data,
+@@ -526,9 +486,6 @@ def update_service_version(service,
+         service.current_version = new_version
+         service.save()
+ 
+-        if 'health_checks' in request_data:
+-            update_health_checks(service, request_data['health_checks'])
+-
+         if 'instance_envvars' in request_data:
+             # Create new envvars for the new version as they were updated.
+             service.current_version.envvar_set.clear()
+@@ -592,20 +549,7 @@ def validate_volume(data):
+         raise SvenException('bad_request', message_params=['Auto scaling mode or multi instances can not use volume'])
+ 
+ 
+-def validate_health_checks(service_config):
+-
+-    if service_config.get('health_checks'):
+-        if 'alauda_load_balancer' in service_config:
+-            raise SvenException('bad_request', message_params=[
+-                '"alauda_load_balancer" mode does not support "health_checks"'])
+-        elif 'raw_container_ports' in service_config:
+-            raise SvenException('bad_request', message_params=[
+-                '"raw_container_ports" mode does not support "health_checks"'])
+-        else:
+-            validate_health_check_config(service_config['health_checks'])
+-
+-
+-def validate_health_check_config(health_check_config):
++def validate_health_checks(health_check_config):
+     if not health_check_config:
+         return
+ 
+@@ -616,10 +560,9 @@ def validate_health_check_config(health_check_config):
+     errors = list(errors)
+     if errors:
+         raise SvenException('bad_request', message_params=[
+-            'health_checks: ' + errors[0].message
++            errors[0].message
+         ])
+ 
+-    container_ports = []
+     for health_check in health_check_config:
+         if 'COMMAND' == health_check['protocol'] and 'command' not in health_check:
+             raise SvenException('bad_request', message_params=[
+@@ -638,12 +581,6 @@ def validate_health_check_config(health_check_config):
+                 raise SvenException('bad_request', message_params=[
+                     '"path" is required for protocol "HTTP"'
+                 ])
+-        if health_check.get('port') in container_ports:
+-            raise SvenException('bad_request', message_params=[
+-                'Multi health check config found for port {}'.format(health_check['port'])
+-                ])
+-        elif health_check.get('port'):
+-            container_ports.append(health_check['port'])
+ 
+ 
+ def create_service(req):
+@@ -699,7 +636,6 @@ def create_service(req):
+                                                   protocol=port['protocol'],
+                                                   ip_address=port.get('ipaddress'))
+             container_ports.add(port['container_port'])
+-
+     for lb in data.get('load_balancers', []):
+         model_lb = models.LoadBalancer.objects.create(
+             service=service,
+@@ -730,23 +666,14 @@ def create_service(req):
+     elif data['network_mode'] == 'STATIC_IP':
+         service.current_version.envvar_set.create(name='__ALAUDA_PRIVATE_IP__', value=data['private_ip'])
+ 
+-    # health check configuration is excepted to be empty in RAW and HA mode
+-    allocation_ports_hc = [
+-        health_check['port']
+-        for health_check in data.get('health_checks', [])
+-        if health_check.get('port') and health_check['port'] not in allocation_ports
+-    ]
+-
+-    for allocation_port in itertools.chain(allocation_ports, allocation_ports_hc):
++    for allocation_port in allocation_ports:
+         host_port = None
+         if data['network_mode'] == 'BRIDGE':
+             host_port = portallocator.allocate_port_bridge(data['region_id'])
+             service.rawcontainerendpoint_set.filter(container_port=allocation_port).update(host_port=host_port)
+         elif data['network_mode'] == 'HOST':
+             host_port = portallocator.allocate_port_host(data['region_id'], allocation_port)
+-        is_aliens = allocation_port in allocation_ports_hc
+-        service.hostport_set.create(host_port=host_port, container_port=allocation_port,
+-                                    is_aliens=is_aliens)
++        service.hostport_set.create(host_port=host_port, container_port=allocation_port)
+ 
+     if 'instance_envvars' in data:
+         for envvar_name, envvar_value in data['instance_envvars'].items():
